@@ -111,7 +111,7 @@ void mkdir(char pathName[])
     /* duplicate check */
     for (struct NODE *p = parent->childPtr; p; p = p->siblingPtr) {
         if (strcmp(p->name, baseName) == 0) {
-            printf("MKDIR ERROR: directory %s already exists\n", baseName);
+            printf("MKDIR ERROR: directory %s already exists\n", pathName);
             return;
         }
     }
