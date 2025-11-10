@@ -6,85 +6,83 @@
 extern struct NODE* root;
 extern struct NODE* cwd;
 
-/* --- Local safe helpers --- */
-static void copy_cap(char *dst, size_t dstsz, const char *src) {
-    if (!dst || dstsz == 0) return;
-    if (!src) { dst[0] = '\0'; return; }
-    /* copy at most dstsz-1 chars, always NUL-terminate */
-    size_t n = dstsz - 1;
-    strncpy(dst, src, n);
-    dst[n] = '\0';
-}
+/* Local caps (match README/types.h expectations) */
+#define BASENAME_MAX   63     /* fits struct NODE.name[64] */
+#define DIRNAME_MAX    511
+#define WORKBUF_MAX    511
 
-/*
- * splitPath:
- *  - Fills baseName (final component) and dirName (prefix).
- *  - Traverses from root/cwd through dirName and returns the parent NODE*.
- *  - On missing directory, prints:
- *        ERROR: directory <TOKEN> does not exist
- *    and returns NULL.
+/* splitPath:
+ * - Fills dirName (prefix) and baseName (final component) WITHOUT modifying pathName
+ * - Returns pointer to the parent NODE of baseName (or NULL on error)
+ * - Prints: ERROR: directory <DIRECTORY> does not exist    on first missing dir
+ *
+ * Rules from README:
+ *   "/"           -> dirName="/", baseName=""
+ *   "f1.txt"      -> dirName="",  baseName="f1.txt"       (relative)
+ *   "/a/b/c.txt"  -> dirName="/a/b", baseName="c.txt"     (absolute)
+ *   "/a/b/c"      -> dirName="/a/b", baseName="c"
  */
 struct NODE* splitPath(char* pathName, char* baseName, char* dirName)
 {
-    /* Defensive defaults for the caller's buffers */
-    if (baseName) baseName[0] = '\0';
+    /* Defensive init of outputs */
     if (dirName)  dirName[0]  = '\0';
+    if (baseName) baseName[0] = '\0';
 
+    /* Edge: empty or "/" */
     if (!pathName || pathName[0] == '\0' || strcmp(pathName, "/") == 0) {
-        /* Treat empty or "/" as root parent */
-        copy_cap(dirName, 512, "/");
+        if (dirName)  { strncpy(dirName, "/", DIRNAME_MAX); dirName[DIRNAME_MAX] = '\0'; }
+        if (baseName) { baseName[0] = '\0'; }
         return root;
     }
 
-    /* Detect the ACTUAL max name length from struct NODE.name */
-    struct NODE _probe;
-    const size_t NAME_CAP = (sizeof _probe.name > 0 ? sizeof _probe.name - 1 : 0);
-
-    /* Start point: absolute → root, relative → cwd */
+    /* Start point depends on absolute vs relative */
     struct NODE* start = (pathName[0] == '/') ? root : cwd;
 
-    /* Work on a bounded temporary copy we can mutate */
-    char tmp[512];
-    copy_cap(tmp, sizeof tmp, pathName);
+    /* Work on a local copy so we NEVER modify pathName (fixes test #6) */
+    char copy[WORKBUF_MAX + 1];
+    strncpy(copy, pathName, WORKBUF_MAX);
+    copy[WORKBUF_MAX] = '\0';
 
-    /* Trim trailing slashes but keep lone "/" */
-    size_t L = strlen(tmp);
-    while (L > 1 && tmp[L - 1] == '/') { tmp[--L] = '\0'; }
+    /* (Optional) trim trailing slashes (keep lone "/") */
+    size_t L = strlen(copy);
+    while (L > 1 && copy[L - 1] == '/') { copy[--L] = '\0'; }
 
-    /* Split into dirName + baseName using the last '/' */
-    char* lastSlash = strrchr(tmp, '/');
-    if (!lastSlash) {
-        /* No slash at all: relative single token like "a...long..." */
-        if (baseName) copy_cap(baseName, NAME_CAP + 1, tmp);
+    /* Split copy into dirName/baseName using last '/' in the COPY */
+    char *last = strrchr(copy, '/');
+    if (!last) {
+        /* No slash at all: relative single token */
         if (dirName)  dirName[0] = '\0';
+        if (baseName) { strncpy(baseName, copy, BASENAME_MAX); baseName[BASENAME_MAX] = '\0'; }
     } else {
-        /* baseName = after last '/', dirName = before it (or "/") */
-        if (baseName) copy_cap(baseName, NAME_CAP + 1, lastSlash + 1);
+        /* base = after last '/', dir = before it (or "/") */
+        if (baseName) { strncpy(baseName, last + 1, BASENAME_MAX); baseName[BASENAME_MAX] = '\0'; }
 
-        if (lastSlash == tmp && tmp[0] == '/') {
-            if (dirName) copy_cap(dirName, 512, "/");
+        if (last == copy && copy[0] == '/') {
+            /* like "/name" => dirName="/" */
+            if (dirName) { strncpy(dirName, "/", DIRNAME_MAX); dirName[DIRNAME_MAX] = '\0'; }
         } else {
-            *lastSlash = '\0';
-            if (dirName) copy_cap(dirName, 512, tmp);
+            *last = '\0';  /* mutate the COPY (safe) */
+            if (dirName) { strncpy(dirName, copy, DIRNAME_MAX); dirName[DIRNAME_MAX] = '\0'; }
         }
     }
 
-    /* If no traversal needed ("" or "/"), return the chosen start */
-    if (!dirName || dirName[0] == '\0' || strcmp(dirName, "/") == 0) {
-        return start;
-    }
-
-    /* Tokenize dirName and traverse down */
-    char walk[512];
-    copy_cap(walk, sizeof walk, dirName);
-
-    char* tok = strtok(walk, "/");
+    /* Decide the node to start traversal from */
     struct NODE* cur = start;
 
+    /* If dirName empty or "/" no traversal needed */
+    if (!dirName || dirName[0] == '\0' || strcmp(dirName, "/") == 0) {
+        return cur;
+    }
+
+    /* Tokenize a SECOND copy (so dirName itself remains intact) */
+    char walk[WORKBUF_MAX + 1];
+    strncpy(walk, dirName, WORKBUF_MAX);
+    walk[WORKBUF_MAX] = '\0';
+
+    char *tok = strtok(walk, "/");
     while (tok) {
-        /* Search only directories among cur's children */
-        struct NODE* child = cur->childPtr;
-        struct NODE* found = NULL;
+        struct NODE *child = cur->childPtr;
+        struct NODE *found = NULL;
 
         while (child) {
             if (child->fileType == 'D' && strcmp(child->name, tok) == 0) {
@@ -95,6 +93,7 @@ struct NODE* splitPath(char* pathName, char* baseName, char* dirName)
         }
 
         if (!found) {
+            /* First non-existent directory on the path */
             printf("ERROR: directory %s does not exist\n", tok);
             return NULL;
         }
@@ -103,14 +102,17 @@ struct NODE* splitPath(char* pathName, char* baseName, char* dirName)
         tok = strtok(NULL, "/");
     }
 
-    return cur; /* parent of baseName */
+    /* cur now is the parent directory node of baseName */
+    return cur;
 }
 
-/*
- * mkdir:
- *  - Treats pathName == "/" as "no arg" (your main defaults missing path to "/").
- *  - Uses splitPath() to locate the parent and final name.
- *  - Duplicate check, allocate node, insert as last child.
+/* mkdir:
+ * - Uses splitPath() to resolve parent + baseName
+ * - Errors:
+ *     "MKDIR ERROR: no path provided"                for "/" or empty
+ *     "MKDIR ERROR: directory <DIRECTORY> already exists" if duplicate
+ * - Success:
+ *     "MKDIR SUCCESS: node <NODE> successfully created"
  */
 void mkdir(char pathName[])
 {
@@ -119,52 +121,46 @@ void mkdir(char pathName[])
         return;
     }
 
-    /* Detect name capacity from struct NODE */
-    struct NODE _probe;
-    const size_t NAME_CAP = (sizeof _probe.name > 0 ? sizeof _probe.name - 1 : 0);
+    /* buffers for split results */
+    char baseName[BASENAME_MAX + 1];
+    char dirName[DIRNAME_MAX + 1];
 
-    char baseName[256];  /* working buffer for final component (bigger than any struct name) */
-    char dirName[512];
-
-    struct NODE* parent = splitPath(pathName, baseName, dirName);
-    if (!parent) return;
+    struct NODE *parent = splitPath(pathName, baseName, dirName);
+    if (!parent) return;                     /* splitPath already printed error */
 
     if (baseName[0] == '\0') {
+        /* No final component provided */
         printf("MKDIR ERROR: no path provided\n");
         return;
     }
 
-    /* Duplicate check under parent */
-    for (struct NODE* p = parent->childPtr; p; p = p->siblingPtr) {
+    /* Duplicate check under 'parent' */
+    for (struct NODE *p = parent->childPtr; p; p = p->siblingPtr) {
         if (strcmp(p->name, baseName) == 0) {
             printf("MKDIR ERROR: directory %s already exists\n", baseName);
             return;
         }
     }
 
-    /* Allocate & initialize new node */
-    struct NODE* n = (struct NODE*)malloc(sizeof(struct NODE));
+    /* Allocate and initialize the new directory node */
+    struct NODE *n = (struct NODE*)malloc(sizeof(struct NODE));
     if (!n) { perror("malloc"); return; }
-    memset(n, 0, sizeof *n);
 
-    /* Copy/truncate final name to fit struct NODE.name exactly */
-    if (NAME_CAP > 0) {
-        strncpy(n->name, baseName, NAME_CAP);
-        n->name[NAME_CAP] = '\0';
-    } else {
-        n->name[0] = '\0';
-    }
+    memset(n, 0, sizeof(*n));
+    /* Truncate name to fit struct NODE.name[64] */
+    strncpy(n->name, baseName, BASENAME_MAX);
+    n->name[BASENAME_MAX] = '\0';
 
     n->fileType   = 'D';
     n->parentPtr  = parent;
     n->childPtr   = NULL;
     n->siblingPtr = NULL;
 
-    /* Insert as last child */
+    /* Insert as last child of parent */
     if (!parent->childPtr) {
         parent->childPtr = n;
     } else {
-        struct NODE* t = parent->childPtr;
+        struct NODE *t = parent->childPtr;
         while (t->siblingPtr) t = t->siblingPtr;
         t->siblingPtr = n;
     }
